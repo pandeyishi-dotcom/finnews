@@ -1,4 +1,14 @@
-# finnews.py
+import subprocess
+import sys
+
+def install_if_missing(package):
+    try:
+        __import__(package)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+for pkg in ["gnews", "pandas", "plotly", "vaderSentiment", "wordcloud", "matplotlib"]:
+    install_if_missing(pkg)# finnews.py
 import datetime as dt
 import math
 from functools import lru_cache
