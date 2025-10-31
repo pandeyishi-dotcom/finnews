@@ -1,7 +1,7 @@
-streamlit
-pandas
-plotly
-gnews
-vaderSentiment
-wordcloud
-matplotlib
+streamlit>=1.20
+gnews>=0.3.7
+pandas>=1.5
+vaderSentiment>=3.3.2
+wordcloud>=1.8.2
+matplotlib>=3.6
+numpy>=1.24
