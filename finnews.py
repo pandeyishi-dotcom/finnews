@@ -1,7 +1,6 @@
 # finnews.py
 import streamlit as st
 import pandas as pd
-from gnews import GNews
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from wordcloud import WordCloud
 import matplotlib.pyplot as plt
