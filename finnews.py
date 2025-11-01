@@ -1,24 +1,26 @@
 # app.py
 """
-Bluechip Fund Sentiment Analyzer Pro — Modular Skeleton
-- Fetchers: NewsAPI (newsapi-python) or GNews (gnews)
-- Sentiment: VADER (vaderSentiment)
-- Visuals: Plotly (preferred) with Streamlit fallbacks
-- Wordcloud and a lightweight summary function included
-- Designed to be extended: add transformers, NAV fetch, alerts.
+Bluechip Fund Sentiment Analyzer Pro — Fully working prototype
+- Uses NewsAPI if NEWSAPI_KEY provided, else falls back to GNews
+- VADER sentiment
+- Optional transformer summarization (if transformers installed)
+- Plotly visuals, wordclouds, Slack alerting (optional)
 """
 
 import os
+import re
+import time
+import json
 from datetime import datetime, timedelta
 from functools import lru_cache
+from collections import Counter
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import re
-from collections import Counter
+import requests
 
-# Optional libs; we'll import them later with try/except to allow graceful degradation
+# optional libs (graceful degradation)
 try:
     from newsapi import NewsApiClient
 except Exception:
@@ -48,12 +50,19 @@ except Exception:
     WordCloud = None
     plt = None
 
-# -------------------------
-# Config & constants
-# -------------------------
+# transformers summarizer (optional; heavy)
+try:
+    from transformers import pipeline
+    HAS_TRANSFORMERS = True
+except Exception:
+    HAS_TRANSFORMERS = False
+
+# ------------------------
+# Config
+# ------------------------
 st.set_page_config(page_title="Bluechip Fund Sentiment Analyzer Pro", layout="wide")
-st.title("Bluechip Fund Sentiment Analyzer Pro — Modular Skeleton")
-st.markdown("Modular app: fetch → clean → sentiment → visualize → summarize. Toggle components in the sidebar.")
+st.title("Bluechip Fund Sentiment Analyzer Pro")
+st.markdown("Multi-source news → sentiment → visualization. Use NewsAPI (key) or GNews (no key).")
 
 DEFAULT_FUNDS = [
     "HDFC Bluechip Fund",
@@ -65,104 +74,101 @@ DEFAULT_FUNDS = [
     "Canara Robeco Bluechip Equity Fund"
 ]
 
-TIME_PERIODS = {
-    "7d": 7,
-    "30d": 30,
-    "90d": 90,
-    "180d": 180
+TIME_OPTIONS = {
+    "7 Days": 7,
+    "30 Days": 30,
+    "90 Days": 90,
+    "180 Days": 180
 }
 
-# -------------------------
-# Utility helpers
-# -------------------------
-def safe_lower(text):
-    return text.lower() if isinstance(text, str) else ""
-
+# ------------------------
+# Helpers
+# ------------------------
 def clean_text(text):
     if not isinstance(text, str):
         return ""
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"http\S+", "", text)  # drop urls
-    text = re.sub(r"[^\w\s\.\-]", "", text)  # keep words punctuation limited
-    return text.strip()
+    t = re.sub(r"http\S+", "", text)
+    t = re.sub(r"\s+", " ", t)
+    t = t.strip()
+    return t
 
-def date_n_days_ago(n):
-    return (datetime.utcnow() - timedelta(days=n)).strftime("%Y-%m-%d")
+def format_date(dt):
+    if pd.isna(dt):
+        return ""
+    if isinstance(dt, str):
+        return dt
+    try:
+        return pd.to_datetime(dt).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(dt)
 
-# -------------------------
-# FETCHERS
-# -------------------------
-@lru_cache(maxsize=64)
-def fetch_news_via_newsapi(api_key, query, from_date, page_size=50, max_pages=2):
-    """Fetch using NewsAPI. Returns list of articles (dict)."""
+# ------------------------
+# News fetchers
+# ------------------------
+@lru_cache(maxsize=128)
+def fetch_news_newsapi(api_key, query, from_date_iso, page_size=50, max_pages=2):
     if not NewsApiClient:
-        st.error("newsapi-python package not installed.")
         return []
     client = NewsApiClient(api_key=api_key)
-    articles = []
+    all_articles = []
     page = 1
     while page <= max_pages:
         try:
             res = client.get_everything(q=query,
-                                        from_param=from_date,
-                                        language='en',
-                                        sort_by='publishedAt',
+                                        from_param=from_date_iso,
+                                        to=datetime.utcnow().strftime("%Y-%m-%d"),
+                                        language="en",
+                                        sort_by="publishedAt",
                                         page_size=page_size,
                                         page=page)
         except Exception as e:
-            st.error(f"NewsAPI error: {e}")
+            st.error(f"NewsAPI fetch error: {e}")
             break
         arts = res.get("articles", []) or []
         if not arts:
             break
-        articles.extend(arts)
+        all_articles.extend(arts)
         if len(arts) < page_size:
             break
         page += 1
-    return articles
+    return all_articles
 
-@lru_cache(maxsize=64)
-def fetch_news_via_gnews(query, days=7, max_results=30):
-    """Fetch using GNews (scraping-based). Returns list of dicts similar to NewsAPI's minimal fields."""
+@lru_cache(maxsize=128)
+def fetch_news_gnews(query, days=7, max_results=40):
     if not GNews:
-        st.error("gnews package not installed.")
         return []
-    gn = GNews(language='en', country='IN', max_results=max_results)
+    gn = GNews(language="en", country="IN", max_results=max_results)
     gn.period = f"{days}d"
     try:
-        results = gn.get_news(query)
+        res = gn.get_news(query)
     except Exception as e:
-        st.error(f"GNews error: {e}")
-        results = []
-    # Normalize results to match the fields we use later
+        st.error(f"GNews fetch error: {e}")
+        return []
     normalized = []
-    for r in results:
+    for r in res:
         normalized.append({
             "title": r.get("title"),
             "description": r.get("description"),
             "url": r.get("url"),
             "publishedAt": r.get("published date") or r.get("published_date") or None,
-            "source": {"name": r.get("publisher", {}).get("title", "") if isinstance(r.get("publisher"), dict) else r.get("publisher")}
+            "source": {"name": (r.get("publisher") or {}).get("title") if isinstance(r.get("publisher"), dict) else r.get("publisher")}
         })
     return normalized
 
-# -------------------------
-# CLEAN & DEDUP
-# -------------------------
-def make_article_df(raw_articles, fund_name):
-    """Normalize a list of article dicts to a DataFrame with specific columns"""
+# ------------------------
+# Normalizer / dedupe
+# ------------------------
+def normalize_articles(raw_articles, fund_name):
     rows = []
     for a in raw_articles:
         title = clean_text(a.get("title") or "")
         desc = clean_text(a.get("description") or "")
         url = a.get("url") or ""
-        # support both 'publishedAt' or 'published date' formats
-        pub = a.get("publishedAt") or a.get("published date") or a.get("published_date") or None
-        # try safe parse; keep as string if parse fails
+        published = a.get("publishedAt") or a.get("published date") or a.get("published_date") or None
         try:
-            pub_dt = pd.to_datetime(pub)
+            published_dt = pd.to_datetime(published)
         except Exception:
-            pub_dt = None
+            published_dt = None
         source = a.get("source", {}).get("name") if isinstance(a.get("source"), dict) else a.get("source") or ""
         rows.append({
             "fund": fund_name,
@@ -170,24 +176,22 @@ def make_article_df(raw_articles, fund_name):
             "description": desc,
             "content": (title + ". " + desc).strip(),
             "url": url,
-            "publishedAt": pub_dt,
+            "publishedAt": published_dt,
             "source": source
         })
     df = pd.DataFrame(rows)
-    # dedupe by title + url
-    if not df.empty:
-        df["dupe_key"] = df["title"].str.slice(0, 200).fillna("") + "|" + df["url"].fillna("")
-        df = df.drop_duplicates(subset="dupe_key")
-        df = df.drop(columns=["dupe_key"])
+    if df.empty:
+        return df
+    df["dupe_key"] = df["title"].str.slice(0,200).fillna("") + "|" + df["url"].fillna("")
+    df = df.drop_duplicates(subset="dupe_key").drop(columns=["dupe_key"])
     return df
 
-# -------------------------
-# SENTIMENT
-# -------------------------
-def init_sentiment_analyzer():
+# ------------------------
+# Sentiment
+# ------------------------
+def get_sentiment_analyzer():
     if SentimentIntensityAnalyzer:
         return SentimentIntensityAnalyzer()
-    st.warning("VADER not installed. Sentiment values will be zero.")
     class Dummy:
         def polarity_scores(self, t): return {"compound": 0.0}
     return Dummy()
@@ -201,94 +205,99 @@ def add_sentiment(df, analyzer):
     df["sentiment_label"] = df["sentiment"].apply(lambda s: "Positive" if s > 0.05 else ("Negative" if s < -0.05 else "Neutral"))
     return df
 
-# -------------------------
-# AGGREGATION & METRICS
-# -------------------------
-def aggregate_sentiment(df, freq="D"):
+# ------------------------
+# Aggregation & buzz
+# ------------------------
+def aggregate_by_day(df):
     if df.empty:
         return pd.DataFrame()
     d = df.copy()
     d["date"] = d["publishedAt"].dt.date
-    agg = d.groupby(["fund", "date"]).agg(
-        articles=("title", "count"),
-        avg_sentiment=("sentiment", "mean")
-    ).reset_index()
+    agg = d.groupby(["fund", "date"]).agg(articles=("title", "count"), avg_sentiment=("sentiment", "mean")).reset_index()
     return agg
 
-def compute_buzz_score(df):
+def compute_buzz(df):
     if df.empty:
         return 0.0
     count = len(df)
     mean_sent = df["sentiment"].mean()
     days = (pd.Timestamp.utcnow() - df["publishedAt"].fillna(pd.Timestamp.utcnow())).dt.days.clip(lower=0)
     recency_weights = np.exp(-days/30)
-    mean_recency = recency_weights.mean()
+    mean_recency = recency_weights.mean() if len(recency_weights)>0 else 0.0
     return float(mean_sent * count * mean_recency)
 
-# -------------------------
-# SIMPLE SUMMARY (lightweight)
-# -------------------------
+# ------------------------
+# Summarizer (optional transformers)
+# ------------------------
+SUMMARIZER = None
+if HAS_TRANSFORMERS:
+    try:
+        # small & general summarizer — transformer download may take time
+        SUMMARIZER = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+    except Exception:
+        SUMMARIZER = None
+
+def summarize_articles_transformers(texts, max_chars=600):
+    if not SUMMARIZER:
+        return None
+    joined = " ".join([t for t in texts if t])
+    if not joined.strip():
+        return ""
+    # transformers summarizers usually accept up to a token limit; truncate conservatively
+    joined = joined[:8000]
+    try:
+        out = SUMMARIZER(joined, max_length=130, min_length=30, do_sample=False)
+        return out[0]["summary_text"]
+    except Exception:
+        return None
+
 def simple_headline_summary(df, top_n=3):
-    """Return a short bullet summary from most common keywords and top headlines."""
     if df.empty:
         return "No articles to summarize."
     titles = df["title"].dropna().tolist()
-    # top headlines
     top_headlines = titles[:top_n]
-    # extract most common words excluding stopwords
-    stop = set(["the","and","in","to","of","for","on","with","a","is","at","by","from"])
+    stop = set(["the","and","in","to","of","for","on","with","a","is","at","by","from","fund","et","al"])
     words = []
     for t in titles:
         for w in re.findall(r"\w{3,}", t.lower()):
             if w not in stop:
                 words.append(w)
     common = Counter(words).most_common(6)
-    common_str = ", ".join([w for w,_ in common])
-    summary = f"Top themes: {common_str}. Top headlines:\n" + "\n".join([f"- {h}" for h in top_headlines])
+    themes = ", ".join([w for w,_ in common]) if common else ""
+    summary = f"Top themes: {themes}. Top headlines:\n" + "\n".join([f"- {h}" for h in top_headlines])
     return summary
 
-# -------------------------
-# VISUALIZATIONS
-# -------------------------
-def plot_sentiment_trend(agg_df, funds_selected):
+# ------------------------
+# Visuals
+# ------------------------
+def plot_sentiment_trend(agg_df):
     if agg_df.empty:
-        st.info("No data to plot.")
+        st.info("No sentiment trend data.")
         return
     if px:
         fig = px.line(agg_df, x="date", y="avg_sentiment", color="fund", markers=True,
-                      title="Sentiment trend (avg sentiment per day)")
+                      title="Average sentiment over time (by fund)")
         st.plotly_chart(fig, use_container_width=True)
     else:
-        # fallback: pivot and st.line_chart
         pivot = agg_df.pivot(index="date", columns="fund", values="avg_sentiment").fillna(0)
         st.line_chart(pivot)
 
-def plot_heatmap_latest(df):
-    if df.empty:
-        st.info("No data for heatmap.")
+def plot_article_counts(agg_df):
+    if agg_df.empty:
         return
-    # compute average sentiment per fund
-    avg = df.groupby("fund").agg(avg_sentiment=("sentiment", "mean")).reset_index()
-    if avg.empty:
-        st.info("Heatmap: no averages.")
-        return
-    if px:
-        fig = px.imshow(avg[["avg_sentiment"]].T, x=avg["fund"], y=["avg_sentiment"], color_continuous_scale="RdYlGn",
-                        aspect="auto", title="Average sentiment per fund")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.bar_chart(avg.set_index("fund")["avg_sentiment"])
+    dfc = agg_df.groupby("fund").agg(total_articles=("articles","sum")).reset_index()
+    st.bar_chart(dfc.set_index("fund")["total_articles"])
 
 def show_wordcloud(df, fund_name=None):
     if WordCloud is None or plt is None:
-        st.info("WordCloud / matplotlib not installed.")
+        st.info("WordCloud not available (missing dependencies).")
         return
     texts = df["content"].dropna().tolist()
     if fund_name:
-        texts = df[df["fund"] == fund_name]["content"].dropna().tolist()
+        texts = df[df["fund"]==fund_name]["content"].dropna().tolist()
     text = " ".join(texts)
     if not text.strip():
-        st.info("No text for wordcloud.")
+        st.info("No text for word cloud.")
         return
     wc = WordCloud(width=800, height=400, background_color="white").generate(text)
     plt.figure(figsize=(10,4))
@@ -296,112 +305,178 @@ def show_wordcloud(df, fund_name=None):
     plt.axis("off")
     st.pyplot(plt)
 
-# -------------------------
-# STREAMLIT UI
-# -------------------------
-def sidebar_controls():
+# ------------------------
+# Alerts (Slack webhook optional)
+# ------------------------
+def send_slack_alert(webhook_url, message):
+    if not webhook_url:
+        return False
+    try:
+        payload = {"text": message}
+        r = requests.post(webhook_url, json=payload, timeout=10)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+# ------------------------
+# Streamlit UI
+# ------------------------
+def sidebar():
     st.sidebar.header("Controls")
     funds = st.sidebar.multiselect("Select funds (multi)", DEFAULT_FUNDS, default=DEFAULT_FUNDS[:3])
-    if not funds:
-        funds = DEFAULT_FUNDS[:1]
-    days_label = st.sidebar.selectbox("Time window", list(TIME_PERIODS.keys()), index=1)
-    days = TIME_PERIODS[days_label]
-    source_choice = st.sidebar.radio("News source", ["NewsAPI (requires key)", "GNews (no key)"], index=1)
-    api_key = None
-    if source_choice.startswith("NewsAPI"):
-        api_key = st.sidebar.text_input("NewsAPI key", value=os.getenv("NEWSAPI_KEY",""), placeholder="paste your NewsAPI key here")
-    options = {
+    days_label = st.sidebar.selectbox("Time window", list(TIME_OPTIONS.keys()), index=1)
+    days = TIME_OPTIONS[days_label]
+    source = st.sidebar.radio("Source", ["Auto: NewsAPI if key, else GNews", "Force NewsAPI", "Force GNews"], index=0)
+    api_key = st.sidebar.text_input("NewsAPI Key (optional)", value=os.getenv("NEWSAPI_KEY",""))
+    slack_webhook = st.sidebar.text_input("Slack webhook URL (optional)", value=os.getenv("SLACK_WEBHOOK",""))
+    st.sidebar.markdown("---")
+    st.sidebar.write("Transformer summarizer:", "✅ available" if SUMMARIZER else "❌ not available")
+    st.sidebar.markdown("Upload NAV CSV to correlate (columns: fund, date (YYYY-MM-DD), nav)")
+    nav_file = st.sidebar.file_uploader("NAV CSV", type=["csv"])
+    return {
         "funds": funds,
         "days": days,
-        "source": source_choice,
-        "api_key": api_key
+        "source": source,
+        "api_key": api_key.strip(),
+        "slack_webhook": slack_webhook.strip(),
+        "nav_file": nav_file
     }
-    return options
 
 def main():
-    opts = sidebar_controls()
+    opts = sidebar()
     funds = opts["funds"]
     days = opts["days"]
-    source = opts["source"]
+    source_choice = opts["source"]
     api_key = opts["api_key"]
+    slack_webhook = opts["slack_webhook"]
+    nav_file = opts["nav_file"]
 
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("Extensions:\n- Add transformer summaries\n- Add NAV fetch (AMFI)\n- Add alerting (email/telegram)")
+    if not funds:
+        st.warning("Select at least one fund.")
+        st.stop()
 
-    st.header("Fetch & Analyze")
-    st.write(f"Fetching {len(funds)} funds over last {days} days using {source}.")
+    st.write(f"Fetching news for {len(funds)} funds over last {days} days.")
 
-    raw_all = []
+    raw_frames = []
     for fund in funds:
-        query = f'"{fund}" OR "{fund.split()[0]} fund"'
-        st.write(f"Fetching: {fund} ...")
-        if source.startswith("NewsAPI"):
+        q = f'"{fund}" OR "{fund.split()[0]} fund"'
+        st.info(f"Fetching: {fund}")
+        use_newsapi = False
+        if source_choice.startswith("Force NewsAPI"):
+            use_newsapi = True
+        elif source_choice.startswith("Force GNews"):
+            use_newsapi = False
+        else:
+            use_newsapi = bool(api_key and NewsApiClient)
+        articles = []
+        if use_newsapi:
             if not api_key:
-                st.warning("NewsAPI selected but no key provided. Skipping NewsAPI fetch.")
+                st.warning("NewsAPI key missing — skipping NewsAPI fetch.")
+            else:
+                from_iso = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+                articles = fetch_news_newsapi(api_key, q, from_iso, page_size=50, max_pages=2)
+        else:
+            if not GNews:
+                st.warning("GNews package not installed — cannot use GNews.")
                 articles = []
             else:
-                articles = fetch_news_via_newsapi(api_key=api_key, query=query, from_date=date_n_days_ago(days))
-        else:
-            articles = fetch_news_via_gnews(query=query, days=days)
-        df_f = make_article_df(articles, fund)
-        raw_all.append(df_f)
+                articles = fetch_news_gnews(q, days=days, max_results=60)
+        df_f = normalize_articles(articles, fund)
+        raw_frames.append(df_f)
+        time.sleep(0.2)  # polite pause
 
-    if len(raw_all) == 0:
-        st.error("No fetchers configured or no data fetched.")
-        return
+    if not raw_frames:
+        st.error("No fetchers executed.")
+        st.stop()
 
-    all_df = pd.concat(raw_all, ignore_index=True) if any(not d.empty for d in raw_all) else pd.DataFrame()
-    if all_df.empty:
-        st.warning("No articles found for chosen funds/timeframe.")
-        return
+    combined = pd.concat(raw_frames, ignore_index=True) if any(len(x)>0 for x in raw_frames) else pd.DataFrame()
+    if combined.empty:
+        st.warning("No articles found for selected funds/timeframe.")
+        st.stop()
 
-    # sentiment
-    analyzer = init_sentiment_analyzer()
-    all_df = add_sentiment(all_df, analyzer)
+    analyzer = get_sentiment_analyzer()
+    combined = add_sentiment(combined, analyzer)
 
-    # Show table and metrics
-    st.subheader("Raw articles sample")
-    st.dataframe(all_df[["fund","publishedAt","title","source","sentiment","sentiment_label"]].sort_values("publishedAt", ascending=False).head(200))
+    # show top table
+    st.subheader("Articles (sample)")
+    show_cols = ["fund","publishedAt","source","title","sentiment","sentiment_label","url"]
+    st.dataframe(combined[show_cols].sort_values("publishedAt", ascending=False).head(300))
 
-    # Aggregation
-    agg = aggregate_sentiment(all_df)
+    agg = aggregate_by_day(combined)
 
-    # Visuals
-    st.subheader("Sentiment Trend")
-    plot_sentiment_trend(agg, funds)
+    st.subheader("Sentiment trend")
+    plot_sentiment_trend(agg)
 
-    st.subheader("Fund heatmap (avg sentiment)")
-    plot_heatmap_latest(all_df)
+    st.subheader("Article counts (total)")
+    plot_article_counts(agg)
 
     st.subheader("Buzz leaderboard")
-    buzz_list = []
+    buzz = []
     for f in funds:
-        df_f = all_df[all_df["fund"] == f]
-        buzz_list.append({
+        df_f = combined[combined["fund"]==f]
+        buzz.append({
             "fund": f,
             "articles": len(df_f),
-            "avg_sentiment": df_f["sentiment"].mean() if not df_f.empty else 0.0,
-            "buzz": compute_buzz_score(df_f)
+            "avg_sentiment": float(df_f["sentiment"].mean()) if len(df_f)>0 else 0.0,
+            "buzz": compute_buzz(df_f)
         })
-    buzz_df = pd.DataFrame(buzz_list).sort_values("buzz", ascending=False)
+    buzz_df = pd.DataFrame(buzz).sort_values("buzz", ascending=False)
     st.table(buzz_df)
 
-    st.subheader("Word Clouds (per fund)")
+    # Word clouds
+    st.subheader("Word clouds")
     cols = st.columns(min(3, len(funds)))
     for i, f in enumerate(funds):
         with cols[i % 3]:
             st.markdown(f"**{f}**")
-            show_wordcloud(all_df, fund_name=f)
+            show_wordcloud(combined, fund_name=f)
 
     # Summaries
-    st.subheader("Auto Summaries (lightweight)")
+    st.subheader("Automated summaries")
     for f in funds:
         st.markdown(f"**{f}**")
-        df_f = all_df[all_df["fund"] == f].sort_values("publishedAt", ascending=False)
-        st.write(simple_headline_summary(df_f, top_n=3))
+        df_f = combined[combined["fund"]==f].sort_values("publishedAt", ascending=False)
+        texts = df_f["title"].fillna("").tolist()
+        summary = None
+        if SUMMARIZER and len(texts)>0:
+            summary = summarize_articles_transformers(texts, max_chars=400)
+        if not summary:
+            summary = simple_headline_summary(df_f, top_n=3)
+        st.write(summary)
 
-    st.success("Analysis complete. Extend the modules to add model summaries, NAV correlation, and alerts.")
+    # Optional: NAV correlation if uploaded
+    if nav_file:
+        try:
+            nav_df = pd.read_csv(nav_file)
+            nav_df["date"] = pd.to_datetime(nav_df["date"]).dt.date
+            st.subheader("NAV correlation (upload provided)")
+            # pick first fund for example correlation
+            target_fund = funds[0]
+            nav_f = nav_df[nav_df["fund"]==target_fund]
+            if nav_f.empty:
+                st.info(f"No NAV rows for fund {target_fund} in uploaded file.")
+            else:
+                articles_daily = combined[combined["fund"]==target_fund].groupby(combined["publishedAt"].dt.date).size().reset_index(name="articles")
+                merged = pd.merge(nav_f, articles_daily, left_on="date", right_on="publishedAt", how="left").fillna(0)
+                if not merged.empty:
+                    st.line_chart(merged.set_index("date")[["nav","articles"]])
+        except Exception as e:
+            st.error(f"Failed to process NAV CSV: {e}")
+
+    # Alerts: if buzz spike for top fund beyond threshold, send Slack notification
+    try:
+        top = buzz_df.iloc[0]
+        if top["articles"] >= 10 and abs(top["avg_sentiment"]) > 0.3:
+            # a heuristic threshold for noisy spike
+            if slack_webhook := opts.get("slack_webhook", ""):
+                msg = f"Alert: {top['fund']} has {top['articles']} articles and avg sentiment {top['avg_sentiment']:.2f}. Buzz: {top['buzz']:.2f}"
+                ok = send_slack_alert(slack_webhook, msg)
+                if ok:
+                    st.success("Slack alert sent for top buzz fund.")
+    except Exception:
+        pass
+
+    st.success("Analysis complete.")
 
 if __name__ == "__main__":
     main()
-
